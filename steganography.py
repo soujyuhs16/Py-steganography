@@ -1,3 +1,7 @@
+import random
+import zlib
+import hashlib
+
 class Steganography:
     try:
         from PIL import Image
@@ -5,15 +9,24 @@ class Steganography:
         print('Missing packages, run `python3 -m pip install --upgrade -r requirements.txt`')
         exit(1)
 
-    def __init__(self, eof=16, bits=2):
+    def __init__(self, eof=16, bits=2, salt=b''):
         """Initalizes the Steganograpy object. 
 
         Args:
             eof (int, optional): the length of the leading zeroes of the hidden message. Defaults to 16.
             bits (int, optional): the number of bits used for the message. Defaults to 2.
+            salt (bytes, optional): the salt value for random pixel order. Defaults to b''.
         """
         self.EOF_LENGTH = eof
         self.BITS = bits
+        self.salt = salt
+
+    def _get_pixel_order(self, width, height):
+        """Generates random pixel order based on salt."""
+        coords = [(x, y) for x in range(width) for y in range(height)]
+        random.seed(self.salt)
+        random.shuffle(coords)
+        return coords
 
     def encode(self, img_path: str, text: str, password: str = None) -> str:
         """Hides text inside an image using LSB algorithm.
@@ -32,45 +45,56 @@ class Steganography:
         img = self.Image.open(img_path)
         out = self.Image.new("RGBA", img.size, 0xffffff)
 
+        # compress data
+        data_bytes = text.encode()
+        compressed = zlib.compress(data_bytes)
+
+        # calculate checksum
+        digest = hashlib.sha256(compressed).hexdigest()
+
+        # combine checksum and compressed data
+        combined_data = compressed + b'##CHECKSUM##' + digest.encode()
+
         # encrypt
         if password:
-            text = self.__encrypt(text, password)
+            combined_data = self.__encrypt(combined_data.decode(), password).encode()
 
         # convert to binary
-        binary = list(self.__to_binary(text) + ('0' * self.EOF_LENGTH))
+        binary = list(self.__to_binary(combined_data.decode()) + ('0' * self.EOF_LENGTH))
+
+        # use random pixel order
+        width, height = img.size
+        coords = self._get_pixel_order(width, height)
 
         # loop for image pixels
-        width, height = img.size
-        for x in range(width):
-            for y in range(height):
-                # read pixel from image
-                if img.format == 'PNG':
-                    r, g, b, a = img.getpixel((x, y))
-                else:
-                    r, g, b = img.getpixel((x, y))
+        for x, y in coords:
+            # read pixel from image
+            if img.format == 'PNG':
+                r, g, b, a = img.getpixel((x, y))
+            else:
+                r, g, b = img.getpixel((x, y))
 
-                # modify pixel value
-                new_colors = []
-                for color in (r, g, b):
-                    if not binary:
-                        new_colors.append(color)
-                        continue
+            # modify pixel value
+            new_colors = []
+            for color in (r, g, b):
+                if not binary:
+                    new_colors.append(color)
+                    continue
 
-                    binary_color = bin(color)[:-self.BITS]
-                    for _ in range(self.BITS):
-                        if binary:
-                            binary_color += binary.pop(0)
-                        else:
-                            binary_color += '0'
+                binary_color = bin(color)[:-self.BITS]
+                for _ in range(self.BITS):
+                    if binary:
+                        binary_color += binary.pop(0)
+                    else:
+                        binary_color += '0'
 
-                    new_colors.append(int(binary_color, 2))
+                new_colors.append(int(binary_color, 2))
 
-                # write pixel on out image
-                if img.format == 'PNG':
-                    out.putpixel((x, y), (*new_colors, a))
-                else:
-                    out.putpixel((x, y), (*new_colors, 255))
-
+            # write pixel on out image
+            if img.format == 'PNG':
+                out.putpixel((x, y), (*new_colors, a))
+            else:
+                out.putpixel((x, y), (*new_colors, 255))
 
         # save new image
         out.save(out_name)
@@ -80,7 +104,6 @@ class Steganography:
         out.close()
 
         return out_name
-
 
     def decode(self, img_path: str, password: str = None) -> str:
         """Extracts the hidden message from an image.
@@ -102,36 +125,45 @@ class Steganography:
             print('Invalid image format.')
             exit(1)
         
-        # loop for image pixels
+        # use random pixel order
         width, height = img.size
-        for x in range(width):
-            for y in range(height):
-                # get pixel colors
-                r, g, b, _ = img.getpixel((x, y))
+        coords = self._get_pixel_order(width, height)
 
-                # extract message from pixel colors
-                for color in (r, g, b):
-                    binary += format(color, '#010b')[-self.BITS:]
+        # loop for image pixels
+        for x, y in coords:
+            # get pixel colors
+            r, g, b, _ = img.getpixel((x, y))
 
-                    has_message_ended = binary[-self.EOF_LENGTH:] == ('0' * self.EOF_LENGTH) 
-                    if has_message_ended:
-                        break
+            # extract message from pixel colors
+            for color in (r, g, b):
+                binary += format(color, '#010b')[-self.BITS:]
 
+                has_message_ended = binary[-self.EOF_LENGTH:] == ('0' * self.EOF_LENGTH) 
                 if has_message_ended:
                     break
 
             if has_message_ended:
                 break
-        
+
         # remove padding
-        text = self.__to_text(binary[:-self.EOF_LENGTH])
+        extracted_bytes = self.__to_text(binary[:-self.EOF_LENGTH]).encode()
 
         # decrypt
         if password:
-            text = self.__decrypt(text, password)
+            extracted_bytes = self.__decrypt(extracted_bytes.decode(), password).encode()
+
+        # validate checksum and decompress
+        if b'##CHECKSUM##' in extracted_bytes:
+            payload, chk = extracted_bytes.split(b'##CHECKSUM##', 1)
+            if hashlib.sha256(payload).hexdigest() != chk.decode():
+                print('Checksum mismatch, data may have been tampered with.')
+                return ''
+            decompressed = zlib.decompress(payload)
+            text = decompressed.decode()
+        else:
+            text = ''
 
         return text
-        
 
     def __to_binary(self, text: str) -> str:
         """Converts text to binary.
@@ -192,7 +224,7 @@ class Steganography:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=b'',
+            salt=self.salt,
             iterations=100000,
         )
 
@@ -224,7 +256,7 @@ class Steganography:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=b'',
+            salt=self.salt,
             iterations=100000,
         )
 
@@ -235,5 +267,3 @@ class Steganography:
         except InvalidToken:
             print('Wrong password.')
             exit(1)
-
-
